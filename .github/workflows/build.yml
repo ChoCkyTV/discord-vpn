@@ -1,0 +1,65 @@
+name: Build DiscordVPN.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Baixar núcleo (mihomo) e driver (wintun)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin, tmp | Out-Null
+
+          $assets = gh api repos/MetaCubeX/mihomo/releases/latest --jq '.assets[].name'
+          $name = $assets | Where-Object { $_ -match '^mihomo-windows-amd64-compatible-.*\.zip$' } | Select-Object -First 1
+          if (-not $name) {
+            $name = $assets | Where-Object { $_ -match '^mihomo-windows-amd64-v\d+\.\d+\.\d+\.zip$' } | Select-Object -First 1
+          }
+          if (-not $name) { throw "Asset mihomo windows-amd64 não encontrado" }
+          Write-Host "mihomo: $name"
+          gh release download --repo MetaCubeX/mihomo --pattern $name --dir tmp
+          Expand-Archive "tmp/$name" -DestinationPath tmp/core
+          $exe = Get-ChildItem tmp/core -Filter *.exe | Select-Object -First 1
+          Copy-Item $exe.FullName bin/mihomo.exe
+
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile tmp/wintun.zip
+          Expand-Archive tmp/wintun.zip -DestinationPath tmp/wintun
+          Copy-Item tmp/wintun/wintun/bin/amd64/wintun.dll bin/wintun.dll
+
+      - name: Gerar o .exe
+        run: >
+          pyinstaller --onefile --noconsole --uac-admin --name DiscordVPN
+          --hidden-import pystray._win32
+          --add-binary "bin/mihomo.exe;bin"
+          --add-binary "bin/wintun.dll;bin"
+          main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiscordVPN
+          path: dist/DiscordVPN.exe
+
+      - name: Publicar Release (somente em tags v*)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DiscordVPN.exe
