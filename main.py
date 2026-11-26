@@ -2,6 +2,7 @@
 import ctypes
 import json
 import os
+import queue
 import secrets
 import shutil
 import subprocess
@@ -25,7 +26,9 @@ CORE_DIR = DATA / "core"
 CORE_EXE_NAME = "discordvpn-core.exe"   # nome próprio: não mata o Clash/mihomo de outros apps
 WG_CONF = DATA / "proton.conf"          # formato antigo (v1.0), migrado sozinho
 CONFIGS_DIR = DATA / "configs"          # todos os .conf ficam aqui
-VERSION = "1.1.0"
+SESSION_FILE = DATA / "proton-session.json"   # sessão da Proton (a senha NÃO é guardada)
+HELPER_NAME = "proton-helper.exe"
+VERSION = "2.0.0"
 SETTINGS_FILE = DATA / "settings.json"
 API_PORT = 9097
 TASK_AUTOSTART = "DiscordVPN-Autostart"
@@ -33,7 +36,8 @@ TASK_LAUNCH = "DiscordVPN-LaunchDiscord"
 TEST_URL = "https://www.gstatic.com/generate_204"
 NO_WINDOW = 0x08000000
 
-DEFAULTS = {"autostart": True, "launch_discord": True, "secret": ""}
+DEFAULTS = {"autostart": True, "launch_discord": True, "secret": "",
+            "username": "", "routes_expire": 0, "route_names": {}}
 COLORS = {"off": (140, 140, 140, 255), "connecting": (240, 180, 0, 255),
           "on": (46, 184, 92, 255), "error": (220, 60, 60, 255)}
 LABELS = {"off": "desconectada", "connecting": "conectando…",
@@ -105,6 +109,63 @@ def load_settings():
 def save_settings(s):
     DATA.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(s, indent=2), "utf-8")
+
+
+def sync_bundled():
+    """Copia núcleo, driver e helper da Proton para a pasta de dados."""
+    CORE_DIR.mkdir(parents=True, exist_ok=True)
+    src = bundled_dir()
+    for name, dst in (("mihomo.exe", CORE_EXE_NAME), ("wintun.dll", "wintun.dll"),
+                      ("protonvpn-wg.exe", HELPER_NAME)):
+        s_, d_ = src / name, CORE_DIR / dst
+        if s_.exists() and (not d_.exists() or d_.stat().st_size != s_.stat().st_size):
+            shutil.copy2(s_, d_)
+
+
+def run_helper(args, stdin_obj=None, timeout=240):
+    """Roda o helper de login da Proton. Retorna {"code": int, "json": dict}."""
+    try:
+        sync_bundled()
+    except OSError:
+        pass
+    exe = CORE_DIR / HELPER_NAME
+    if not exe.exists():
+        return {"code": -1, "json": {"success": False, "error": "Helper da Proton não encontrado neste programa."}}
+    kw = {"input": json.dumps(stdin_obj)} if stdin_obj is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        p = subprocess.run([str(exe)] + args, capture_output=True, encoding="utf-8", errors="ignore",
+                           timeout=timeout, creationflags=NO_WINDOW, cwd=str(CORE_DIR), **kw)
+    except subprocess.TimeoutExpired:
+        return {"code": -2, "json": {"success": False, "error": "Tempo esgotado falando com a Proton."}}
+    j = {}
+    for line in reversed((p.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                j = json.loads(line)
+                break
+            except ValueError:
+                continue
+    return {"code": p.returncode, "json": j}
+
+
+def explain_proton_error(j):
+    """(categoria, mensagem em português) a partir do JSON de erro do helper."""
+    code, err = str(j.get("code", "")), str(j.get("error", ""))
+    if code == "TWO_FACTOR_REQUIRED":
+        return "2FA", "Digite o código de 6 dígitos do seu app autenticador (2FA) e clique de novo."
+    if code == "TWO_FACTOR_INVALID":
+        return "2FA", "Código 2FA incorreto ou vencido. Digite o próximo código."
+    if code == "INVALID_CREDENTIALS":
+        return "CRED", "Usuário ou senha incorretos."
+    if code == "APP_VERSION_UNSUPPORTED":
+        return "APPVER", "A Proton não aceita mais esta versão do programa. Baixe a versão nova no GitHub."
+    if j.get("captchaUrl") or "captcha" in (code + err).lower() or "9001" in code + err:
+        return "CAPTCHA", ("A Proton pediu verificação anti-robô (captcha). Entre uma vez em "
+                           "account.proton.me no navegador, aguarde uns minutos e tente de novo.")
+    if code == "NETWORK_ERROR":
+        return "NET", "Sem resposta da Proton agora. Confira a internet e tente de novo."
+    return "ERR", (err[:220] or "Erro desconhecido ao falar com a Proton.")
 
 
 # ------------------------------------------------------- tarefas do Windows
@@ -188,12 +249,18 @@ class App:
         self.proxy_names = []
         self.current = ""
         self.delays = {}
+        self.watching = False
+        self.watch_until = 0
+        self.dialog_open = False
 
     # ---- estado / UI
     def status_text(self):
         if self.state == "on" and self.current:
-            return f"{LABELS['on']} — {self.current}"
+            return f"{LABELS['on']} — {self.pretty(self.current)}"
         return LABELS[self.state] + (f" — {self.msg}" if self.msg and self.state == "error" else "")
+
+    def pretty(self, name):
+        return self.settings.get("route_names", {}).get(name, name)
 
     def notify(self, text):
         try:
@@ -260,11 +327,7 @@ class App:
         CORE_DIR.mkdir(parents=True, exist_ok=True)
         self._stop_core()
         run(["taskkill", "/F", "/IM", CORE_EXE_NAME])
-        src = bundled_dir()
-        for name, dst in (("mihomo.exe", CORE_EXE_NAME), ("wintun.dll", "wintun.dll")):
-            s, d = src / name, CORE_DIR / dst
-            if not d.exists() or d.stat().st_size != s.stat().st_size:
-                shutil.copy2(s, d)
+        sync_bundled()
         cfg = CORE_DIR / "config.yaml"
         cfg.write_text(build_yaml(wgs, self.settings["secret"], API_PORT), "utf-8")
         self.logf = open(CORE_DIR / "core.log", "wb")
@@ -313,9 +376,15 @@ class App:
         try:
             if self.state == "on":
                 return
+            if self.settings.get("username") and SESSION_FILE.exists() and \
+                    (self.routes_stale() or not self.config_files()):
+                self.set_state("connecting")
+                ok, key, msg = self.renew_routes()
+                if not ok:
+                    self.notify(f"Não consegui renovar as rotas da Proton: {msg}")
             if not self.config_files():
                 self.set_state("off")
-                self.add_configs()
+                self.first_run_prompt()
                 return
             self.set_state("connecting")
             if self.settings["launch_discord"]:
@@ -327,7 +396,7 @@ class App:
                 return
             if self._wait_ready():
                 self.set_state("on")
-                self.notify(f"VPN ativa — Discord via {self.current}.")
+                self.notify(f"VPN ativa — Discord via {self.pretty(self.current)}.")
                 if self.settings["launch_discord"] and relaunch:
                     self.launch_discord(restart=True)
             else:
@@ -363,8 +432,20 @@ class App:
 
     # ---- monitor
     def monitor(self):
-        fails = 0
+        fails, last_renew = 0, 0.0
         while not self.quit_evt.wait(10):
+            if self.state == "on" and self.want and time.time() - last_renew > 3600:
+                last_renew = time.time()
+                if self.settings.get("username") and self.routes_stale():
+                    ok, key, msg = self.renew_routes()
+                    if ok:
+                        self.notify("Rotas da Proton renovadas. Reconectando…")
+                        self.disconnect(quiet=True)
+                        self._wait_idle()
+                        self.connect(relaunch=False)
+                    else:
+                        self.notify(f"Não consegui renovar as rotas: {msg}")
+                    continue
             if self.state != "on" or not self.want:
                 fails = 0
                 continue
@@ -380,7 +461,7 @@ class App:
                 fails = 0
                 if not dead and len(self.proxy_names) > 1 and self.pick_best():
                     self.set_state("on")
-                    self.notify(f"Servidor trocado para {self.current}.")
+                    self.notify(f"Servidor trocado para {self.pretty(self.current)}.")
                     continue
                 self._stop_core()
                 self.set_state("error", "VPN caiu — reconectando (Discord fica sem rede, sem vazar IP)")
@@ -467,6 +548,216 @@ class App:
                 self.connect()
         threading.Thread(target=work, daemon=True).start()
 
+    # ---- login na Proton (helper)
+    def routes_stale(self):
+        exp = self.settings.get("routes_expire", 0)
+        return bool(exp) and time.time() > exp - 36 * 3600
+
+    def proton_login(self, username, password, code):
+        r = run_helper(["-username", username, "-session-file", str(SESSION_FILE),
+                        "-login-only", "-json", "-stdin-secrets"],
+                       {"password": password, "twoFactorCode": code, "humanVerificationToken": ""},
+                       timeout=90)
+        if r["code"] != 0 or r["json"].get("success") is False:
+            key, msg = explain_proton_error(r["json"])
+            return False, key, msg
+        self.settings["username"] = username
+        save_settings(self.settings)
+        return self.renew_routes()
+
+    def renew_routes(self):
+        """Gera os melhores servidores Free (validados por ping) usando a sessão salva."""
+        u = self.settings.get("username", "")
+        if not u:
+            return False, "NOACC", "Faça login na Proton."
+        tmp = DATA / "routes_new"
+        last = (False, "ERR", "Não consegui gerar as rotas.")
+        for n in (3, 2, 1):
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True, exist_ok=True)
+            r = run_helper(["-username", u, "-session-file", str(SESSION_FILE), "-route-pool",
+                            "-route-pool-size", str(n), "-route-pool-output-dir", str(tmp),
+                            "-json", "-free-only", "-auto-ping"], timeout=240)
+            j = r["json"]
+            files = sorted(tmp.glob("route-*.conf"))
+            if r["code"] == 0 and j.get("success") and files:
+                CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+                for old in CONFIGS_DIR.glob("route-*.conf"):
+                    old.unlink(missing_ok=True)
+                for f in files:
+                    shutil.move(str(f), str(CONFIGS_DIR / f.name))
+                names = {}
+                for x in j.get("routes", []):
+                    stem = Path(str(x.get("confFile", ""))).stem
+                    names[stem] = f"{x.get('server', stem)} ({x.get('country', '?')}, {x.get('pingMs', '?')} ms)"
+                exp = float(j.get("expiresAt") or (time.time() + 6 * 86400))
+                if exp > 1e11:
+                    exp /= 1000
+                self.settings["route_names"] = names
+                self.settings["routes_expire"] = int(exp)
+                save_settings(self.settings)
+                shutil.rmtree(tmp, ignore_errors=True)
+                return True, "OK", f"{len(files)} rota(s) gerada(s)."
+            key, msg = explain_proton_error(j)
+            last = (False, key, msg)
+            if "validated" not in str(j.get("error", "")):      # não é falta de rotas: não adianta repetir
+                break
+        shutil.rmtree(tmp, ignore_errors=True)
+        return last
+
+    def refresh_routes(self):
+        def work():
+            if not self.settings.get("username") or not SESSION_FILE.exists():
+                self.login_dialog()
+                return
+            self.notify("Procurando os melhores servidores Free…")
+            ok, key, msg = self.renew_routes()
+            if not ok:
+                if key in ("CRED", "NOACC") or "session" in msg.lower() or "sess" in msg.lower():
+                    self.login_dialog()
+                msgbox(msg, icon=0x30)
+                return
+            self.disconnect(quiet=True)
+            self._wait_idle()
+            self.connect()
+        threading.Thread(target=work, daemon=True).start()
+
+    def logout_proton(self):
+        self.disconnect(quiet=True)
+        self._wait_idle()
+        SESSION_FILE.unlink(missing_ok=True)
+        for f in CONFIGS_DIR.glob("route-*.conf"):
+            f.unlink(missing_ok=True)
+        self.settings.update({"username": "", "routes_expire": 0, "route_names": {}})
+        save_settings(self.settings)
+        self.notify("Saí da conta Proton neste PC.")
+
+    def login_dialog(self):
+        if self.dialog_open:
+            return
+        self.dialog_open = True
+
+        def work():
+            try:
+                import tkinter as tk
+                from tkinter import ttk
+                q = queue.Queue()
+                root = tk.Tk()
+                root.title("Discord VPN — Entrar na Proton")
+                root.attributes("-topmost", True)
+                root.resizable(False, False)
+                f = ttk.Frame(root, padding=16)
+                f.grid()
+                ttk.Label(f, text="Entre com sua conta Proton (Free).\nSua senha não é salva neste PC.",
+                          wraplength=340).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="w")
+                user, pw, code = tk.StringVar(value=self.settings.get("username", "")), tk.StringVar(), tk.StringVar()
+                ttk.Label(f, text="Usuário ou e-mail").grid(row=1, column=0, sticky="w")
+                ttk.Entry(f, textvariable=user, width=34).grid(row=1, column=1, pady=3)
+                ttk.Label(f, text="Senha").grid(row=2, column=0, sticky="w")
+                ttk.Entry(f, textvariable=pw, show="*", width=34).grid(row=2, column=1, pady=3)
+                ttk.Label(f, text="Código 2FA (se tiver)").grid(row=3, column=0, sticky="w")
+                ttk.Entry(f, textvariable=code, width=34).grid(row=3, column=1, pady=3)
+                status = tk.StringVar()
+                ttk.Label(f, textvariable=status, wraplength=340, foreground="#b00").grid(
+                    row=4, column=0, columnspan=2, pady=6, sticky="w")
+                btn = ttk.Button(f, text="Entrar e escolher o melhor servidor")
+                btn.grid(row=5, column=0, columnspan=2, sticky="ew")
+                ttk.Button(f, text="Prefiro importar um .conf manualmente",
+                           command=lambda: (root.destroy(), self.add_configs())).grid(
+                    row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+                def submit(event=None):
+                    u, p, c = user.get().strip(), pw.get(), code.get().strip()
+                    if not u or not p:
+                        status.set("Preencha usuário e senha.")
+                        return
+                    btn.state(["disabled"])
+                    status.set("Entrando e medindo os servidores… (1 a 2 minutos)")
+                    threading.Thread(target=lambda: q.put(self.proton_login(u, p, c)), daemon=True).start()
+
+                def poll():
+                    try:
+                        ok, key, msg = q.get_nowait()
+                    except queue.Empty:
+                        root.after(300, poll)
+                        return
+                    if ok:
+                        pw.set("")
+                        root.destroy()
+                        if self.settings["autostart"]:
+                            set_autostart(True)
+                        self.disconnect(quiet=True)
+                        self._wait_idle()
+                        self.connect()
+                        return
+                    btn.state(["!disabled"])
+                    status.set(msg)
+                    if key == "CRED":
+                        pw.set("")
+
+                btn.configure(command=submit)
+                root.bind("<Return>", submit)
+                root.after(300, poll)
+                root.mainloop()
+            finally:
+                self.dialog_open = False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- assistente: importa sozinho os .conf baixados da Proton
+    def first_run_prompt(self):
+        self.login_dialog()
+
+    def start_assistant(self):
+        import webbrowser
+        self.watch_until = time.time() + 900          # observa a pasta Downloads por 15 min
+        if not self.watching:
+            self.watching = True
+            threading.Thread(target=self._watch_downloads, daemon=True).start()
+        webbrowser.open("https://account.protonvpn.com/downloads")
+        self.notify("Crie e baixe 3 configs WireGuard (Windows, servidores Free). Eu importo sozinho.")
+
+    def _already_have(self, wg):
+        for f in CONFIGS_DIR.glob("*.conf"):
+            try:
+                o = parse_wireguard(f.read_text("utf-8-sig"))
+            except (ConfigError, OSError, UnicodeDecodeError):
+                continue
+            if o["private_key"] == wg["private_key"] and o["server"] == wg["server"]:
+                return True
+        return False
+
+    def _watch_downloads(self):
+        folder = Path(os.environ.get("USERPROFILE", "")) / "Downloads"
+        start, done, added, last_add = time.time(), set(), 0, 0.0
+        while not self.quit_evt.wait(3) and time.time() < self.watch_until:
+            try:
+                for f in folder.glob("*.conf"):
+                    mt = f.stat().st_mtime
+                    if (f.name, mt) in done or mt < start - 600:
+                        continue
+                    done.add((f.name, mt))
+                    try:
+                        text = f.read_text("utf-8-sig")
+                        wg = parse_wireguard(text)
+                    except (ConfigError, OSError, UnicodeDecodeError):
+                        continue
+                    if self._already_have(wg):
+                        continue
+                    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+                    (CONFIGS_DIR / (f.stem + ".conf")).write_text(text, "utf-8")
+                    added, last_add = added + 1, time.time()
+                if added and time.time() - last_add > 8:     # espera terminar os downloads
+                    self.notify(f"{added} servidor(es) importado(s). Conectando…")
+                    added = 0
+                    if self.settings["autostart"]:
+                        set_autostart(True)
+                    self.disconnect(quiet=True)
+                    self._wait_idle()
+                    self.connect()
+            except Exception:
+                pass
+        self.watching = False
+
     def open_configs_folder(self):
         CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
         os.startfile(CONFIGS_DIR)
@@ -480,13 +771,13 @@ class App:
             if not best:
                 msgbox("Nenhum servidor respondeu.", icon=0x30)
                 return
-            lines = [f"{'→' if n == best else '   '} {n}: {d} ms"
+            lines = [f"{'→' if n == best else '   '} {self.pretty(n)}: {d} ms"
                      for n, d in sorted(self.delays.items(), key=lambda x: x[1])]
             text = "Latência até cada servidor (menor = melhor):\n\n" + "\n".join(lines)
             fail = [n for n in self.proxy_names if n not in self.delays]
             if fail:
-                text += "\n\nSem resposta: " + ", ".join(fail)
-            msgbox(text + f"\n\nUsando agora: {best}")
+                text += "\n\nSem resposta: " + ", ".join(self.pretty(n) for n in fail)
+            msgbox(text + f"\n\nUsando agora: {self.pretty(best)}")
             self.set_state("on")
         threading.Thread(target=work, daemon=True).start()
 
@@ -519,9 +810,15 @@ class App:
                 target=self.launch_discord, daemon=True).start()),
             M("Diagnóstico (conexões do Discord)", lambda icon, item: self.diagnose()),
             I.SEPARATOR,
+            M("Entrar na Proton (login)…", lambda icon, item: self.login_dialog()),
+            M("Atualizar rotas (melhores servidores Free)", lambda icon, item: self.refresh_routes()),
             M("Testar servidores e usar o melhor", lambda icon, item: self.test_servers()),
-            M("Adicionar .conf (Proton)…", lambda icon, item: self.add_configs()),
-            M("Abrir pasta dos .conf", lambda icon, item: self.open_configs_folder()),
+            M("Mais opções", I(
+                M("Adicionar .conf manualmente…", lambda icon, item: self.add_configs()),
+                M("Baixar .conf da Proton (assistente)", lambda icon, item: self.start_assistant()),
+                M("Abrir pasta dos .conf", lambda icon, item: self.open_configs_folder()),
+                M("Sair da conta Proton neste PC", lambda icon, item: self.logout_proton()),
+            )),
             M("Iniciar com o Windows", self.toggle("autostart"),
               checked=lambda item: self.settings["autostart"]),
             M("Este programa abre o Discord após a VPN", self.toggle("launch_discord"),
@@ -538,7 +835,7 @@ class App:
             if self.settings["autostart"] and "--autostart" not in sys.argv:
                 threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
         else:
-            self.add_configs()
+            self.first_run_prompt()
 
     def run(self):
         self.icon = pystray.Icon(APP, make_icon(COLORS["off"]), "Discord VPN", self.build_menu())

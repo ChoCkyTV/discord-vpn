@@ -1,32 +1,31 @@
 # Discord VPN
 
-Usa a **Proton VPN Free (WireGuard)** somente no Discord. O resto do PC continua na conexão normal.
+Usa a **Proton VPN Free** somente no Discord, com **login automático**. O resto do PC continua na conexão normal.
 
 ## Como funciona
-- Um núcleo (mihomo) cria um adaptador de rede (TUN) e manda para o túnel WireGuard da Proton **apenas** os processos `Discord.exe` (e PTB/Canary). Voz (UDP) e chat passam pela VPN.
-- O programa fica na bandeja do Windows. Se a VPN cair, o Discord fica sem rede (não vaza seu IP real).
-- IPv6 do Discord é bloqueado (o túnel é IPv4), então ele usa IPv4 pela VPN.
+- Você entra com usuário e senha da Proton (a senha **não é salva**; fica só a sessão).
+- O programa pede à Proton os **3 melhores servidores Free** para a sua localização (validados por ping) e usa o de menor latência.
+- Um núcleo (mihomo) cria um adaptador de rede e manda para o túnel **apenas** `Discord.exe` (e PTB/Canary). Voz e chat passam pela VPN.
+- Se a VPN cair, o Discord fica sem rede (não vaza seu IP real). O IPv6 do Discord é bloqueado.
+- As rotas vencem em 7 dias; o programa renova sozinho em segundo plano (usa a sessão, sem pedir a senha).
+- Inicia com o Windows (tarefa agendada, sem UAC), conecta a VPN e só depois abre o Discord.
 
 ## Gerar o .exe no GitHub
-1. Crie um repositório e envie estes arquivos (mantendo `.github/workflows/build.yml`).
-2. Aba **Actions** → o build roda sozinho a cada push. Baixe o `DiscordVPN.exe` em *Artifacts*.
-3. Para publicar em **Releases**: `git tag v1.0.0 && git push origin v1.0.0`.
-
-## Configurar a Proton (v1.1: vários servidores)
-1. Em account.protonvpn.com → **Downloads → WireGuard configuration**.
-2. Plataforma **Windows**. Crie e baixe **3 a 5** `.conf` de servidores **Free** diferentes (ex.: os de menor carga).
-3. Na bandeja: **Adicionar .conf (Proton)…** e selecione todos de uma vez.
-4. O programa mede a latência de cada um e usa o melhor para o seu PC. Para refazer a medição: **Testar servidores e usar o melhor**.
+1. Envie estes arquivos para um repositório (mantendo `.github/workflows/build.yml`).
+2. Aba **Actions**: o build roda a cada push. Baixe o `DiscordVPN.exe` em *Artifacts*.
+3. Para publicar em **Releases**: crie uma release com a tag `v2.0.0`.
 
 ## Usar
 1. Coloque o `DiscordVPN.exe` numa pasta fixa (ex.: `C:\Programas\DiscordVPN`) e execute (pede admin uma vez).
-2. Selecione os `.conf` quando pedir.
-3. Pronto: ele registra a inicialização com o Windows (tarefa agendada, sem UAC), conecta a VPN e só então abre o Discord.
-4. No Discord, desative **Configurações → Configurações do Windows → Abrir Discord**, para ele não abrir antes da VPN.
+2. Na primeira vez abre a janela de login. Entre com a conta Proton e aguarde 1 a 2 minutos.
+3. No Discord, desative **Configurações → Configurações do Windows → Abrir Discord**.
 
-Menu da bandeja: conectar/desconectar, abrir Discord, **Diagnóstico** (mostra quantas conexões do Discord passam pela VPN), trocar o `.conf`, opções de inicialização.
+Se tiver 2FA, digite o código de 6 dígitos do app autenticador (chaves de segurança FIDO2 não funcionam). Se a Proton pedir captcha, entre uma vez em account.proton.me no navegador e tente de novo. Também dá para importar `.conf` manualmente (menu Mais opções).
+
+## Licenças
+O login usa o helper `proton-confgen`, GPL-3.0, de https://github.com/bezumiya/GoLiveBypass (commit fixado no `build.yml`), baseado em https://github.com/hatemosphere/protonvpn-wg-confgen. O .exe inclui esse programa e o mihomo (GPL-3.0); o código-fonte está nesses links.
 
 ## Avisos
-- Todo o tráfego do PC passa pelo adaptador TUN (o que não é Discord sai direto), com pequeno custo de desempenho.
-- Antivírus podem alertar (exe do PyInstaller + núcleo de proxy). Se acontecer, adicione exceção na pasta.
-- Logs do núcleo: `%APPDATA%\DiscordVPN\core\core.log`.
+- Cliente não oficial: o helper se identifica como o app Linux da Proton. A Proton pode bloquear versões antigas (o programa avisa para atualizar).
+- Antivírus podem alertar (exe do PyInstaller + núcleo de proxy). Crie exceção na pasta se acontecer.
+- Logs: `%APPDATA%\DiscordVPN\core\core.log`.
