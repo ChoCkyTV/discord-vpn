@@ -45,12 +45,33 @@ jobs:
           Expand-Archive tmp/wintun.zip -DestinationPath tmp/wintun
           Copy-Item tmp/wintun/wintun/bin/amd64/wintun.dll bin/wintun.dll
 
+      - name: Código do helper de login da Proton (GPL-3.0, projeto GoLiveBypass)
+        uses: actions/checkout@v4
+        with:
+          repository: bezumiya/GoLiveBypass
+          ref: d3fb60de5c6ae83737a92e248635caa1a9afe508   # commit fixo: só mude depois de revisar o código
+          path: upstream
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/tools/proton-confgen/go.mod
+
+      - name: Compilar o helper da Proton
+        working-directory: upstream/tools/proton-confgen
+        shell: pwsh
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags "-s -w" -o ../../../bin/protonvpn-wg.exe ./cmd/protonvpn-wg
+
       - name: Gerar o .exe
         run: >
           pyinstaller --onefile --noconsole --uac-admin --name DiscordVPN
           --hidden-import pystray._win32
           --add-binary "bin/mihomo.exe;bin"
           --add-binary "bin/wintun.dll;bin"
+          --add-binary "bin/protonvpn-wg.exe;bin"
           main.py
 
       - uses: actions/upload-artifact@v4
