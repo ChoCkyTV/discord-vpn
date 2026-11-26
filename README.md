@@ -10,11 +10,6 @@ Usa a **Proton VPN Free** somente no Discord, com **login automático**. O resto
 - As rotas vencem em 7 dias; o programa renova sozinho em segundo plano (usa a sessão, sem pedir a senha).
 - Inicia com o Windows (tarefa agendada, sem UAC), conecta a VPN e só depois abre o Discord.
 
-## Gerar o .exe no GitHub
-1. Envie estes arquivos para um repositório (mantendo `.github/workflows/build.yml`).
-2. Aba **Actions**: o build roda a cada push. Baixe o `DiscordVPN.exe` em *Artifacts*.
-3. Para publicar em **Releases**: crie uma release com a tag `v2.0.0`.
-
 ## Usar
 1. Coloque o `DiscordVPN.exe` numa pasta fixa (ex.: `C:\Programas\DiscordVPN`) e execute (pede admin uma vez).
 2. Na primeira vez abre a janela de login. Entre com a conta Proton e aguarde 1 a 2 minutos.
