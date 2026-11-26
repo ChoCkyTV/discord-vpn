@@ -64,7 +64,19 @@ def parse_wireguard(text: str) -> dict:
     }
 
 
-def build_yaml(wg: dict, secret: str, api_port: int = 9097) -> str:
+def safe_name(stem: str, used: set) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-") or "servidor"
+    if name == PROXY_NAME:
+        name += "-1"
+    base, i = name, 2
+    while name in used:
+        name, i = f"{base}-{i}", i + 1
+    used.add(name)
+    return name
+
+
+def build_yaml(wgs: list, secret: str, api_port: int = 9097) -> str:
+    """wgs: lista de dicts de parse_wireguard(), cada um com a chave extra 'name'."""
     q = json.dumps  # string JSON também é YAML válido
     L = [
         "log-level: warning",
@@ -93,20 +105,31 @@ def build_yaml(wg: dict, secret: str, api_port: int = 9097) -> str:
         "    - 8.8.8.8",
         "",
         "proxies:",
-        f"  - name: {q(PROXY_NAME)}",
-        "    type: wireguard",
-        f"    server: {q(wg['server'])}",
-        f"    port: {wg['port']}",
-        f"    ip: {q(wg['ip'])}",
-        f"    private-key: {q(wg['private_key'])}",
-        f"    public-key: {q(wg['public_key'])}",
-        '    allowed-ips: ["0.0.0.0/0"]',
-        "    udp: true",
     ]
-    if wg.get("psk"):
-        L.append(f"    pre-shared-key: {q(wg['psk'])}")
-    if wg.get("mtu"):
-        L.append(f"    mtu: {wg['mtu']}")
+    for wg in wgs:
+        L += [
+            f"  - name: {q(wg['name'])}",
+            "    type: wireguard",
+            f"    server: {q(wg['server'])}",
+            f"    port: {wg['port']}",
+            f"    ip: {q(wg['ip'])}",
+            f"    private-key: {q(wg['private_key'])}",
+            f"    public-key: {q(wg['public_key'])}",
+            '    allowed-ips: ["0.0.0.0/0"]',
+            "    udp: true",
+        ]
+        if wg.get("psk"):
+            L.append(f"    pre-shared-key: {q(wg['psk'])}")
+        if wg.get("mtu"):
+            L.append(f"    mtu: {wg['mtu']}")
+    L += [
+        "",
+        "proxy-groups:",
+        f"  - name: {q(PROXY_NAME)}",
+        "    type: select",
+        "    proxies:",
+    ]
+    L += [f"      - {q(wg['name'])}" for wg in wgs]
 
     L += ["", "rules:"]
     for cidr in LAN_RANGES:

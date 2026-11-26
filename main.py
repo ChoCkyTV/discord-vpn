@@ -17,13 +17,15 @@ import pystray
 from PIL import Image, ImageDraw
 
 from core_config import (ConfigError, DISCORD_EXES, PROXY_NAME, build_yaml,
-                         parse_wireguard)
+                         parse_wireguard, safe_name)
 
 APP = "DiscordVPN"
 DATA = Path(os.environ.get("APPDATA", ".")) / APP
 CORE_DIR = DATA / "core"
 CORE_EXE_NAME = "discordvpn-core.exe"   # nome próprio: não mata o Clash/mihomo de outros apps
-WG_CONF = DATA / "proton.conf"
+WG_CONF = DATA / "proton.conf"          # formato antigo (v1.0), migrado sozinho
+CONFIGS_DIR = DATA / "configs"          # todos os .conf ficam aqui
+VERSION = "1.1.0"
 SETTINGS_FILE = DATA / "settings.json"
 API_PORT = 9097
 TASK_AUTOSTART = "DiscordVPN-Autostart"
@@ -183,9 +185,14 @@ class App:
         self.lock = threading.Lock()
         self.quit_evt = threading.Event()
         self.icon = None
+        self.proxy_names = []
+        self.current = ""
+        self.delays = {}
 
     # ---- estado / UI
     def status_text(self):
+        if self.state == "on" and self.current:
+            return f"{LABELS['on']} — {self.current}"
         return LABELS[self.state] + (f" — {self.msg}" if self.msg and self.state == "error" else "")
 
     def notify(self, text):
@@ -208,18 +215,48 @@ class App:
             self.notify(msg)
 
     # ---- API do núcleo
-    def api(self, path, timeout=6):
-        req = urllib.request.Request(f"http://127.0.0.1:{API_PORT}{path}",
-                                     headers={"Authorization": f"Bearer {self.settings['secret']}"})
+    def api(self, path, timeout=6, method="GET", body=None):
+        headers = {"Authorization": f"Bearer {self.settings['secret']}"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(f"http://127.0.0.1:{API_PORT}{path}", data=data,
+                                     headers=headers, method=method)
         with OPENER.open(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+            raw = r.read()
+            return json.loads(raw.decode("utf-8")) if raw else {}
 
     def tunnel_delay(self):
         q = urllib.parse.quote(TEST_URL, safe="")
         return self.api(f"/proxies/{PROXY_NAME}/delay?url={q}&timeout=5000", 9).get("delay", 0)
 
+    def probe_all(self):
+        """Mede a latência de cada servidor, um de cada vez."""
+        q = urllib.parse.quote(TEST_URL, safe="")
+        res = {}
+        for name in self.proxy_names:
+            try:
+                d = self.api(f"/proxies/{urllib.parse.quote(name)}/delay?url={q}&timeout=4000", 7).get("delay", 0)
+                if d > 0:
+                    res[name] = d
+            except Exception:
+                pass
+        return res
+
+    def pick_best(self):
+        """Escolhe o servidor de menor latência para este PC e passa o Discord para ele."""
+        res = self.probe_all()
+        self.delays = res
+        if not res:
+            return None
+        best = min(res, key=res.get)
+        self.api(f"/proxies/{PROXY_NAME}", 5, method="PUT", body={"name": best})
+        self.current = best
+        return best
+
     # ---- núcleo (mihomo)
-    def _start_core(self, wg):
+    def _start_core(self, wgs):
         CORE_DIR.mkdir(parents=True, exist_ok=True)
         self._stop_core()
         run(["taskkill", "/F", "/IM", CORE_EXE_NAME])
@@ -229,7 +266,7 @@ class App:
             if not d.exists() or d.stat().st_size != s.stat().st_size:
                 shutil.copy2(s, d)
         cfg = CORE_DIR / "config.yaml"
-        cfg.write_text(build_yaml(wg, self.settings["secret"], API_PORT), "utf-8")
+        cfg.write_text(build_yaml(wgs, self.settings["secret"], API_PORT), "utf-8")
         self.logf = open(CORE_DIR / "core.log", "wb")
         self.proc = subprocess.Popen(
             [str(CORE_DIR / CORE_EXE_NAME), "-d", str(CORE_DIR), "-f", str(cfg)],
@@ -250,16 +287,18 @@ class App:
                 pass
             self.logf = None
 
-    def _wait_ready(self, timeout=60):
+    def _wait_ready(self, timeout=90):
         end = time.time() + timeout
         while time.time() < end and self.want:
             if self.proc is None or self.proc.poll() is not None:
                 return False
             try:
-                if self.tunnel_delay() > 0:
-                    return True
+                self.api("/version", 2)
             except Exception:
-                pass
+                time.sleep(2)
+                continue
+            if self.pick_best():
+                return True
             time.sleep(2)
         return False
 
@@ -274,21 +313,21 @@ class App:
         try:
             if self.state == "on":
                 return
-            if not WG_CONF.exists():
+            if not self.config_files():
                 self.set_state("off")
-                self.import_conf()
+                self.add_configs()
                 return
             self.set_state("connecting")
             if self.settings["launch_discord"]:
                 disable_discord_autostart()
             try:
-                self._start_core(parse_wireguard(WG_CONF.read_text("utf-8-sig")))
+                self._start_core(self.load_configs())
             except Exception as e:
                 self.set_state("error", str(e))
                 return
             if self._wait_ready():
                 self.set_state("on")
-                self.notify("VPN ativa — apenas o Discord usa a Proton.")
+                self.notify(f"VPN ativa — Discord via {self.current}.")
                 if self.settings["launch_discord"] and relaunch:
                     self.launch_discord(restart=True)
             else:
@@ -300,11 +339,12 @@ class App:
         finally:
             self.lock.release()
 
-    def disconnect(self):
+    def disconnect(self, quiet=False):
         self.want = False
         self._stop_core()
         self.set_state("off")
-        self.notify("VPN desligada. O Discord agora usa sua conexão normal.")
+        if not quiet:
+            self.notify("VPN desligada. O Discord agora usa sua conexão normal.")
 
     def launch_discord(self, restart=False):
         if self.state != "on":
@@ -338,6 +378,10 @@ class App:
                     fails += 1
             if dead or fails >= 3:
                 fails = 0
+                if not dead and len(self.proxy_names) > 1 and self.pick_best():
+                    self.set_state("on")
+                    self.notify(f"Servidor trocado para {self.current}.")
+                    continue
                 self._stop_core()
                 self.set_state("error", "VPN caiu — reconectando (Discord fica sem rede, sem vazar IP)")
                 self.connect(relaunch=False)
@@ -352,8 +396,8 @@ class App:
                 return
             mine = [c for c in conns if "discord" in
                     (c["metadata"].get("process", "") + c["metadata"].get("processPath", "")).lower()]
-            via = [c for c in mine if PROXY_NAME in c.get("chains", [])]
-            out = [c for c in mine if PROXY_NAME not in c.get("chains", [])]
+            via = [c for c in mine if "DIRECT" not in c.get("chains", ["DIRECT"])]
+            out = [c for c in mine if "DIRECT" in c.get("chains", ["DIRECT"])]
             text = (f"Conexões do Discord agora: {len(mine)}\n"
                     f"  • pela VPN: {len(via)}\n  • diretas (fora da VPN): {len(out)}")
             if out:
@@ -363,33 +407,87 @@ class App:
             msgbox(text)
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- importar .conf
-    def import_conf(self):
+    # ---- configs (.conf)
+    def config_files(self):
+        if WG_CONF.exists() and not any(CONFIGS_DIR.glob("*.conf")):   # migra da v1.0
+            CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(WG_CONF), str(CONFIGS_DIR / "proton.conf"))
+        return sorted(CONFIGS_DIR.glob("*.conf"))
+
+    def load_configs(self):
+        used, wgs = set(), []
+        for f in self.config_files():
+            try:
+                wg = parse_wireguard(f.read_text("utf-8-sig"))
+            except (ConfigError, OSError, UnicodeDecodeError):
+                continue
+            wg["name"] = safe_name(f.stem, used)
+            wgs.append(wg)
+        if not wgs:
+            raise ConfigError("Nenhum .conf válido. Use 'Adicionar .conf'.")
+        self.proxy_names = [w["name"] for w in wgs]
+        return wgs
+
+    def _wait_idle(self, timeout=15):
+        end = time.time() + timeout
+        while self.lock.locked() and time.time() < end:
+            time.sleep(0.3)
+
+    def add_configs(self):
         def work():
             import tkinter as tk
             from tkinter import filedialog
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
-            path = filedialog.askopenfilename(
-                title="Selecione o .conf WireGuard baixado da Proton VPN",
+            paths = filedialog.askopenfilenames(
+                title="Selecione um ou mais .conf WireGuard da Proton VPN",
                 filetypes=[("WireGuard", "*.conf"), ("Todos", "*.*")])
             root.destroy()
-            if not path:
+            if not paths:
                 return
-            try:
-                text = Path(path).read_text("utf-8-sig")
-                parse_wireguard(text)
-            except (ConfigError, OSError, UnicodeDecodeError) as e:
-                msgbox(f"Não consegui usar esse arquivo:\n{e}", icon=0x10)
+            CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            ok, bad = 0, []
+            for p in paths:
+                try:
+                    text = Path(p).read_text("utf-8-sig")
+                    parse_wireguard(text)
+                except (ConfigError, OSError, UnicodeDecodeError) as e:
+                    bad.append(f"{Path(p).name}: {e}")
+                    continue
+                (CONFIGS_DIR / (Path(p).stem + ".conf")).write_text(text, "utf-8")
+                ok += 1
+            if bad:
+                msgbox("Não consegui usar:\n" + "\n".join(bad), icon=0x10)
+            if ok:
+                if self.settings["autostart"]:
+                    set_autostart(True)
+                self.disconnect(quiet=True)
+                self._wait_idle()
+                self.connect()
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_configs_folder(self):
+        CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+        os.startfile(CONFIGS_DIR)
+
+    def test_servers(self):
+        def work():
+            if self.state != "on":
+                msgbox("Conecte a VPN primeiro.", icon=0x30)
                 return
-            DATA.mkdir(parents=True, exist_ok=True)
-            WG_CONF.write_text(text, "utf-8")
-            if self.settings["autostart"]:
-                set_autostart(True)
-            if self.state in ("on", "connecting", "error"):
-                self.disconnect()
-            self.connect()
+            best = self.pick_best()
+            if not best:
+                msgbox("Nenhum servidor respondeu.", icon=0x30)
+                return
+            lines = [f"{'→' if n == best else '   '} {n}: {d} ms"
+                     for n, d in sorted(self.delays.items(), key=lambda x: x[1])]
+            text = "Latência até cada servidor (menor = melhor):\n\n" + "\n".join(lines)
+            fail = [n for n in self.proxy_names if n not in self.delays]
+            if fail:
+                text += "\n\nSem resposta: " + ", ".join(fail)
+            msgbox(text + f"\n\nUsando agora: {best}")
+            self.set_state("on")
         threading.Thread(target=work, daemon=True).start()
 
     # ---- bandeja
@@ -411,6 +509,7 @@ class App:
     def build_menu(self):
         M, I = pystray.MenuItem, pystray.Menu
         return I(
+            M(f"Discord VPN v{VERSION}", None, enabled=False),
             M(lambda item: f"Status: {self.status_text()}", None, enabled=False),
             M("Conectar", lambda icon, item: self.connect(),
               visible=lambda item: self.state in ("off", "error")),
@@ -420,7 +519,9 @@ class App:
                 target=self.launch_discord, daemon=True).start()),
             M("Diagnóstico (conexões do Discord)", lambda icon, item: self.diagnose()),
             I.SEPARATOR,
-            M("Importar .conf WireGuard (Proton)…", lambda icon, item: self.import_conf()),
+            M("Testar servidores e usar o melhor", lambda icon, item: self.test_servers()),
+            M("Adicionar .conf (Proton)…", lambda icon, item: self.add_configs()),
+            M("Abrir pasta dos .conf", lambda icon, item: self.open_configs_folder()),
             M("Iniciar com o Windows", self.toggle("autostart"),
               checked=lambda item: self.settings["autostart"]),
             M("Este programa abre o Discord após a VPN", self.toggle("launch_discord"),
@@ -432,12 +533,12 @@ class App:
     def _setup(self, icon):
         icon.visible = True
         threading.Thread(target=self.monitor, daemon=True).start()
-        if WG_CONF.exists():
+        if self.config_files():
             self.connect()
             if self.settings["autostart"] and "--autostart" not in sys.argv:
                 threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
         else:
-            self.import_conf()
+            self.add_configs()
 
     def run(self):
         self.icon = pystray.Icon(APP, make_icon(COLORS["off"]), "Discord VPN", self.build_menu())
